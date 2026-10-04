@@ -1,7 +1,7 @@
 // Service worker: guarda la "carcasa" de la app para que abra rápido y sin
 // conexión (los datos siempre vienen en vivo de Firebase) y muestra las
 // notificaciones push. Funciona en la raíz o en /<repositorio>/ (GitHub Pages).
-const CACHE = "activate-shell-v4";
+const CACHE = "activate-shell-v5";
 const BASE = new URL("./", self.location).pathname; // "/" o "/repo/"
 const SHELL = ["", "index.html", "manifest.webmanifest", "activate-logo.png", "icon-192.png"].map((f) => BASE + f);
 
@@ -25,9 +25,15 @@ self.addEventListener("fetch", (event) => {
   const url = new URL(request.url);
   if (url.origin !== self.location.origin || !url.pathname.startsWith(BASE)) return;
 
-  // Navegación: red primero, carcasa en caché si no hay conexión.
+  // Navegación: siempre la última versión publicada (se revalida con el
+  // servidor, sin esperar a la caché de 10 min de GitHub Pages); carcasa en
+  // caché si no hay conexión.
   if (request.mode === "navigate") {
-    event.respondWith(fetch(request).catch(() => caches.match(BASE + "index.html")));
+    event.respondWith(
+      fetch(request.url, { cache: "no-cache", credentials: "same-origin" }).catch(() =>
+        caches.match(BASE + "index.html"),
+      ),
+    );
     return;
   }
 

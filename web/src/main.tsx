@@ -30,7 +30,23 @@ async function boot() {
   if ("serviceWorker" in navigator && import.meta.env.PROD) {
     window.addEventListener("load", () => {
       const base = import.meta.env.BASE_URL;
-      navigator.serviceWorker.register(`${base}sw.js`, { scope: base }).catch(() => undefined);
+      const hadController = Boolean(navigator.serviceWorker.controller);
+      navigator.serviceWorker
+        .register(`${base}sw.js`, { scope: base, updateViaCache: "none" })
+        .then((registration) => {
+          // Al volver a la app (p. ej. desde la pantalla de inicio) busca versión nueva.
+          document.addEventListener("visibilitychange", () => {
+            if (document.visibilityState === "visible") void registration.update().catch(() => undefined);
+          });
+        })
+        .catch(() => undefined);
+      // Cuando se publica una versión nueva, se recarga una vez para usarla.
+      let reloaded = false;
+      navigator.serviceWorker.addEventListener("controllerchange", () => {
+        if (!hadController || reloaded) return;
+        reloaded = true;
+        window.location.reload();
+      });
     });
   }
 }

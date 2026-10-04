@@ -492,6 +492,51 @@ describe("Chat", () => {
     );
     await assertFails(getDoc(doc(db(OTHER_TRAINER), "chats", CLIENT)));
   });
+
+  test("leído: cada uno marca sólo su propia entrada", async () => {
+    await env.withSecurityRulesDisabled((c) =>
+      setDoc(doc(c.firestore(), "chats", CLIENT), { participantIds: [CLIENT, TRAINER], clientId: CLIENT }),
+    );
+    await assertSucceeds(updateDoc(doc(db(TRAINER), "chats", CLIENT), { [`readBy.${TRAINER}`]: serverTimestamp() }));
+    await assertSucceeds(updateDoc(doc(db(CLIENT), "chats", CLIENT), { [`readBy.${CLIENT}`]: serverTimestamp() }));
+    await assertFails(updateDoc(doc(db(TRAINER), "chats", CLIENT), { [`readBy.${CLIENT}`]: serverTimestamp() }));
+    await assertFails(updateDoc(doc(db(CLIENT), "chats", CLIENT), { [`readBy.${CLIENT}`]: new Date(2030, 0, 1) }));
+  });
+
+  test("responder citando y eliminar para todos (sólo el autor)", async () => {
+    await env.withSecurityRulesDisabled((c) =>
+      setDoc(doc(c.firestore(), "chats", CLIENT), { participantIds: [CLIENT, TRAINER], clientId: CLIENT }),
+    );
+    const ref = doc(collection(db(TRAINER), "chats", CLIENT, "messages"));
+    await assertSucceeds(
+      setDoc(ref, {
+        authorId: TRAINER,
+        authorRole: "trainer",
+        text: "Perfecto",
+        timestamp: serverTimestamp(),
+        isRead: false,
+        replyTo: { id: "m1", text: "¿Mañana a las 10?", authorId: CLIENT },
+      }),
+    );
+    await assertFails(
+      setDoc(doc(collection(db(TRAINER), "chats", CLIENT, "messages")), {
+        authorId: TRAINER,
+        authorRole: "trainer",
+        text: "Hola",
+        timestamp: serverTimestamp(),
+        isRead: false,
+        replyTo: { id: "m1", text: "x".repeat(500), authorId: CLIENT },
+      }),
+    );
+    // El cliente no puede borrar mensajes del entrenador ni editar textos.
+    await assertFails(
+      updateDoc(doc(db(CLIENT), "chats", CLIENT, "messages", ref.id), { text: "", deleted: true, replyTo: null }),
+    );
+    await assertFails(updateDoc(doc(db(TRAINER), "chats", CLIENT, "messages", ref.id), { text: "Editado" }));
+    await assertSucceeds(
+      updateDoc(doc(db(TRAINER), "chats", CLIENT, "messages", ref.id), { text: "", deleted: true, replyTo: null }),
+    );
+  });
 });
 
 describe("Nutrición", () => {

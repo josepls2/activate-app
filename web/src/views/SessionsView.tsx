@@ -1,6 +1,6 @@
 // Port de ios/CodexGym/Views/SessionsView.swift.
 import { useEffect, useMemo, useState } from "react";
-import { Calendar, CalendarCheck, CalendarPlus, Check, CircleUser, Clock, DoorClosed, Plus, Quote, User, UserX } from "lucide-react";
+import { Calendar, CalendarCheck, CalendarPlus, Check, CircleUser, Clock, DoorClosed, MessageCircle, Plus, Quote, User, UserX } from "lucide-react";
 import {
   addDays,
   capitalize,
@@ -25,6 +25,7 @@ import {
   Sheet,
   SlotGrid,
   StatusBadge,
+  go,
   useAppState,
 } from "../ui";
 
@@ -246,6 +247,12 @@ function SessionDetail({ session, onClose }: { session: GymSession; onClose: () 
   const [editDate, setEditDate] = useState(session.date);
   const [editTime, setEditTime] = useState(normalizedTime(session.time, session.duration));
   const [editRoom, setEditRoom] = useState(session.room);
+  const viewer = state.currentUser;
+  const chatClient =
+    viewer?.isTrainer && !isOwnSession
+      ? state.managedUsers.find((u) => u.id === session.clientId && u.role === "client")
+      : null;
+  const canMessage = (isOwnSession && role === "client") || Boolean(chatClient);
 
   return (
     <Sheet title="Detalle" onClose={onClose}>
@@ -306,6 +313,19 @@ function SessionDetail({ session, onClose }: { session: GymSession; onClose: () 
             Guardar cambios
           </button>
         </div>
+      )}
+
+      {canMessage && (
+        <button
+          className="btn btn-secondary"
+          onClick={() => {
+            if (chatClient) void store.openChat(chatClient.id);
+            onClose();
+            go("chat");
+          }}
+        >
+          <MessageCircle size={18} /> {chatClient ? `Escribir a ${chatClient.name.split(" ")[0]}` : "Escribir a mi entrenador"}
+        </button>
       )}
 
       {canComplete && confirmed ? (

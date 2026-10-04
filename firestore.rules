@@ -600,9 +600,17 @@ service cloud.firestore {
       function chatFieldsValid(data) {
         return data.keys().hasOnly([
             'participantIds', 'clientId', 'modifiedAt', 'lastMessageAt',
-            'lastMessageText', 'lastAuthorId'
+            'lastMessageText', 'lastAuthorId', 'readBy'
           ]) &&
-          optionalText(data.get('lastMessageText', null), 1000);
+          optionalText(data.get('lastMessageText', null), 1000) &&
+          data.get('readBy', {}) is map;
+      }
+
+      // «Leído»: cada participante sólo marca su propia entrada y con la hora real.
+      function readByValid(before, after) {
+        let changed = after.get('readBy', {}).diff(before.get('readBy', {})).affectedKeys();
+        return changed.hasOnly([request.auth.uid]) &&
+          (!(request.auth.uid in changed) || after.readBy[request.auth.uid] == request.time);
       }
 
       // get: también el propio cliente cuando su chat todavía no existe.
@@ -619,6 +627,7 @@ service cloud.firestore {
         (isSelf(chatId) || isAssignedTrainer(chatId)) &&
         participantsAllowed(request.resource.data, chatId) &&
         chatFieldsValid(request.resource.data) &&
+        readByValid({}, request.resource.data) &&
         request.resource.data.get('lastAuthorId', request.auth.uid) == request.auth.uid;
 
       // Los participantes actualizan el resumen; sólo el cliente puede
@@ -627,6 +636,7 @@ service cloud.firestore {
         request.auth.uid in resource.data.participantIds &&
         request.resource.data.clientId == resource.data.clientId &&
         chatFieldsValid(request.resource.data) &&
+        readByValid(resource.data, request.resource.data) &&
         (
           !('lastAuthorId' in request.resource.data.diff(resource.data).affectedKeys()) ||
           request.resource.data.lastAuthorId == request.auth.uid
@@ -641,14 +651,25 @@ service cloud.firestore {
       allow delete: if false;
 
       match /messages/{messageId} {
+        function replyValid(reply) {
+          return reply == null || (
+            reply is map &&
+            reply.keys().hasOnly(['id', 'text', 'authorId']) &&
+            reply.id is string && reply.id.size() <= 64 &&
+            reply.authorId is string && reply.authorId.size() <= 128 &&
+            reply.text is string && reply.text.size() <= 140
+          );
+        }
+
         allow read: if signedIn() && request.auth.uid in
           get(/databases/$(database)/documents/chats/$(chatId)).data.participantIds;
         allow create: if signedIn() &&
           request.auth.uid in
             getAfter(/databases/$(database)/documents/chats/$(chatId)).data.participantIds &&
           request.resource.data.keys().hasOnly([
-            'authorId', 'authorRole', 'text', 'timestamp', 'isRead'
+            'authorId', 'authorRole', 'text', 'timestamp', 'isRead', 'replyTo'
           ]) &&
+          replyValid(request.resource.data.get('replyTo', null)) &&
           request.resource.data.authorId == request.auth.uid &&
           request.resource.data.get('authorRole', role()) == role() &&
           request.resource.data.get('isRead', false) == false &&
@@ -656,7 +677,19 @@ service cloud.firestore {
           request.resource.data.text is string &&
           request.resource.data.text.size() > 0 &&
           request.resource.data.text.size() <= 1000;
-        allow update, delete: if false;
+
+        // «Eliminar para todos»: sólo su autor, durante la primera hora.
+        allow update: if signedIn() &&
+          resource.data.authorId == request.auth.uid &&
+          request.auth.uid in
+            get(/databases/$(database)/documents/chats/$(chatId)).data.participantIds &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['text', 'deleted', 'replyTo']) &&
+          request.resource.data.deleted == true &&
+          request.resource.data.text == '' &&
+          request.resource.data.get('replyTo', null) == null &&
+          request.time < resource.data.timestamp + duration.value(1, 'h');
+        allow delete: if false;
+
       }
     }
 

@@ -5,6 +5,8 @@ import {
   todayKey,
   type AppUser,
   type BookingRequest,
+  type ChatMessage,
+  type ChatThread,
   type Challenge,
   type ChallengeProgress,
   type GymSession,
@@ -230,6 +232,38 @@ function engagement(role: UserRole) {
   };
 }
 
+function lauraChat(): ChatThread {
+  return {
+    id: laura.id,
+    clientId: laura.id,
+    participantIds: [laura.id, tobias.id, domi.id],
+    lastMessageText: "Perfecto, allí estaré.",
+    lastMessageAt: new Date(Date.now() - 50 * 60_000),
+    lastAuthorId: laura.id,
+    readBy: { [tobias.id]: new Date(Date.now() - 45 * 60_000), [laura.id]: new Date() },
+  };
+}
+
+function demoMessages(role: UserRole): ChatMessage[] {
+  // Conversación de Laura con su equipo (Tobias y Domi), vista desde cada lado.
+  const me = role === "client" ? laura.id : role === "trainer" ? tobias.id : roger.id;
+  const ago = (min: number) => new Date(Date.now() - min * 60_000);
+  const raw: Omit<ChatMessage, "author">[] = [
+    { id: "m0", authorId: domi.id, text: "Laura, ¿qué tal las agujetas después de la sesión de fuerza?", timestamp: ago(26 * 60), isRead: true },
+    { id: "m0b", authorId: laura.id, text: "Bien, un poco cargadas las piernas pero nada grave 😅", timestamp: ago(25 * 60), isRead: true },
+    { id: "m1", authorId: tobias.id, text: "¡Hola Laura! Mañana a las 10:45 en la sala de arriba 💪", timestamp: ago(60), isRead: true },
+    {
+      id: "m2",
+      authorId: laura.id,
+      text: "Perfecto, allí estaré.",
+      timestamp: ago(50),
+      isRead: true,
+      replyTo: { id: "m1", text: "¡Hola Laura! Mañana a las 10:45 en la sala de arriba 💪", authorId: tobias.id },
+    },
+  ];
+  return raw.map((m) => ({ ...m, author: m.authorId === me ? "user" : "trainer" }));
+}
+
 export function loadDemo(raw: string) {
   // ?demo=new → cliente recién dado de alta (ve la bienvenida).
   const isNew = raw === "new";
@@ -257,9 +291,11 @@ export function loadDemo(raw: string) {
               lastMessageText: "Perfecto, allí estaré.",
               lastMessageAt: new Date(Date.now() - 3_000_000),
               lastAuthorId: laura.id,
+              readBy: { [laura.id]: new Date(Date.now() - 2_000_000) },
             },
           ]
         : [],
+    clientChat: role === "client" ? lauraChat() : null,
     nutritionPlan:
       role === "client"
         ? {
@@ -282,8 +318,7 @@ export function loadDemo(raw: string) {
     messages:
       role !== "reserve"
         ? [
-            { id: "m1", author: "trainer", text: "¡Hola Laura! Mañana a las 10:45 en la sala de arriba 💪", timestamp: new Date(Date.now() - 3_600_000), isRead: true },
-            { id: "m2", author: "user", text: "Perfecto, allí estaré.", timestamp: new Date(Date.now() - 3_000_000), isRead: true },
+            ...demoMessages(role),
           ]
         : [],
   });

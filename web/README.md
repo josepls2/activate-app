@@ -108,8 +108,10 @@ de sala** sólo reserva salas. Los pagos no se gestionan en la app.
   - *Retos*: retos semanales con check-in diario o contador, nota para el
     entrenador y feedback semanal; *Clasificación* semanal opcional (sólo nombre
     e inicial; sesiones = 10 pts + puntos de retos aprobados).
-  - Chat, plan nutricional, consejos de vida sana y (si Dirección lo activa)
-    ciclo.
+  - *Chat* tipo WhatsApp con su equipo de entrenadores: nombre de quien
+    escribe, separadores por día, ✓ enviado / ✓✓ leído, responder citando,
+    copiar y eliminar para todos (la primera hora).
+  - Plan nutricional, consejos de vida sana y (si Dirección lo activa) ciclo.
   - *Perfil*: ajustes agrupados (cuenta, entrenamiento, notificaciones,
     privacidad, ayuda, instalar la app).
 - **Entrenador**
@@ -121,7 +123,10 @@ de sala** sólo reserva salas. Los pagos no se gestionan en la app.
     retos (suma puntos).
   - *Ficha* de cada cliente: asistencia, racha, bono, próximas sesiones, retos y
     **notas privadas** (sólo las ven sus entrenadores y Dirección).
-  - Publica consejos y planes nutricionales; chatea con sus clientes.
+  - *Chats*: bandeja con buscador, no leídos y todos sus clientes (puede
+    empezar la conversación él), respuestas rápidas, acceso a la ficha desde el
+    chat y botón «Escribir a…» en cada sesión.
+  - Publica consejos y planes nutricionales.
 - **Dirección**: todo lo anterior, más retos para todo el centro, **alta
   guiada en 3 pasos** (datos → bono con paquetes 5/10/20 o personalizado y
   entrenadores → confirmar), bonos, cambio de entrenadores, reprogramar o

@@ -67,6 +67,7 @@ import {
   type BookingRequest,
   type BookingStatus,
   type ChatMessage,
+  type ChatReply,
   type Challenge,
   type ChallengeAudience,
   type ChallengeProgress,
@@ -198,6 +199,8 @@ export class AppStore {
   private messageListener: Unsubscribe | null = null;
   /** Invalida aperturas de chat en curso al cambiar de conversación. */
   private chatToken = 0;
+  /** Chats con una marca de leído en curso (evita escrituras repetidas). */
+  private pendingRead = new Set<string>();
   /** Listeners que ya entregaron su primera foto (no se avisa de lo que ya existía). */
   private primed = new Set<string>();
   private toastTimer: ReturnType<typeof setTimeout> | null = null;
@@ -882,13 +885,14 @@ export class AppStore {
     if (token !== this.chatToken || this.state.activeChatId !== clientId) return;
     this.messageListener = onSnapshot(
       query(collection(db, "chats", clientId, "messages"), orderBy("timestamp"), limitToLast(200)),
+      { includeMetadataChanges: true },
       (snap) => {
-        this.markChatSeen(clientId);
         this.set({
           messages: snap.docs
-            .map((d) => messageFromData(d.id, d.data(), user.id))
+            .map((d) => messageFromData(d.id, d.data(), user.id, d.metadata.hasPendingWrites))
             .filter(isDefined),
         });
+        this.markChatSeen(clientId);
       },
       (error) => this.set({ chatError: errorText(error) }),
     );
@@ -907,17 +911,29 @@ export class AppStore {
     this.messageListener = null;
   }
 
-  async sendMessage(text: string) {
+  async sendMessage(text: string, replyTo: ChatMessage | null = null) {
     const user = this.state.currentUser;
     const chatId = this.state.activeChatId ?? (user?.role === "client" ? user.id : null);
     const normalized = text.trim().slice(0, LIMITS.message);
     if (!user || !chatId || !normalized) return;
+    const reply: ChatReply | null =
+      replyTo && !replyTo.deleted
+        ? { id: replyTo.id, text: replyTo.text.slice(0, 140), authorId: replyTo.authorId }
+        : null;
 
     if (this.state.demo) {
       this.set({
         messages: [
           ...this.state.messages,
-          { id: demoId(), author: "user", text: normalized, timestamp: new Date(), isRead: false },
+          {
+            id: demoId(),
+            author: "user",
+            authorId: user.id,
+            text: normalized,
+            timestamp: new Date(),
+            isRead: false,
+            replyTo: reply,
+          },
         ],
       });
       return;
@@ -947,6 +963,7 @@ export class AppStore {
       text: normalized,
       timestamp: serverTimestamp(),
       isRead: false,
+      ...(reply ? { replyTo: reply } : {}),
     });
     try {
       await batch.commit();
@@ -956,7 +973,19 @@ export class AppStore {
     }
   }
 
-  /** Marca local (por dispositivo) de último mensaje visto, para el punto de no leído. */
+  /** Conversación abierta (la del propio cliente o la elegida en la bandeja). */
+  threadFor(chatId: string | null): ChatThread | null {
+    if (!chatId) return null;
+    const { clientChat, chats } = this.state;
+    if (clientChat?.id === chatId) return clientChat;
+    return chats.find((c) => c.id === chatId) ?? null;
+  }
+
+  /**
+   * Marca la conversación como leída: en este dispositivo (punto de no leído
+   * inmediato) y en el chat (✓✓ azul para los demás y no leídos en otros
+   * dispositivos). Sólo escribe cuando hay mensajes ajenos sin leer.
+   */
   private markChatSeen(chatId: string) {
     const uid = this.state.currentUser?.id;
     if (!uid) return;
@@ -966,6 +995,51 @@ export class AppStore {
       /* almacenamiento no disponible */
     }
     this.set({ chatSeenVersion: this.state.chatSeenVersion + 1 });
+    if (this.state.demo || document.visibilityState === "hidden") return;
+
+    const lastIncoming = [...this.state.messages].reverse().find((m) => m.authorId !== uid && !m.pending);
+    if (!lastIncoming) return;
+    const readAt = this.threadFor(chatId)?.readBy[uid]?.getTime() ?? 0;
+    if (readAt >= lastIncoming.timestamp.getTime() || this.pendingRead.has(chatId)) return;
+    this.pendingRead.add(chatId);
+    void updateDoc(doc(this.db, "chats", chatId), { [`readBy.${uid}`]: serverTimestamp() })
+      .catch(() => undefined)
+      .finally(() => this.pendingRead.delete(chatId));
+  }
+
+  /** El autor puede eliminar su mensaje para todos durante la primera hora. */
+  canDeleteMessage(message: ChatMessage) {
+    return (
+      message.author === "user" &&
+      !message.deleted &&
+      !message.pending &&
+      Date.now() - message.timestamp.getTime() < 60 * 60_000
+    );
+  }
+
+  async deleteMessage(message: ChatMessage) {
+    const user = this.state.currentUser;
+    const chatId = this.state.activeChatId;
+    if (!user || !chatId || !this.canDeleteMessage(message)) return;
+    const isLast = this.state.messages[this.state.messages.length - 1]?.id === message.id;
+
+    if (this.state.demo) {
+      this.set({
+        messages: this.state.messages.map((m) =>
+          m.id === message.id ? { ...m, text: "", deleted: true, replyTo: null } : m,
+        ),
+      });
+      return;
+    }
+    const db = this.db;
+    const batch = writeBatch(db);
+    batch.update(doc(db, "chats", chatId, "messages", message.id), { text: "", deleted: true, replyTo: null });
+    if (isLast) batch.update(doc(db, "chats", chatId), { lastMessageText: "Mensaje eliminado" });
+    try {
+      await batch.commit();
+    } catch (error) {
+      this.showToast(errorText(error));
+    }
   }
 
   unreadChatCount(): number {
@@ -1047,12 +1121,13 @@ export class AppStore {
   chatHasUnread(thread: ChatThread): boolean {
     const uid = this.state.currentUser?.id;
     if (!uid || !thread.lastMessageAt || thread.lastAuthorId === uid) return false;
+    let seen = thread.readBy[uid]?.getTime() ?? 0;
     try {
-      const seen = Number(localStorage.getItem(`activate.chatSeen.${uid}.${thread.id}`) ?? 0);
-      return thread.lastMessageAt.getTime() > seen;
+      seen = Math.max(seen, Number(localStorage.getItem(`activate.chatSeen.${uid}.${thread.id}`) ?? 0));
     } catch {
-      return false;
+      /* almacenamiento no disponible */
     }
+    return thread.lastMessageAt.getTime() > seen;
   }
 
   // ---------- Nutrición ----------
@@ -2793,15 +2868,23 @@ function toDate(value: unknown): Date | null {
   return value instanceof Timestamp ? value.toDate() : null;
 }
 
-function messageFromData(id: string, data: DocumentData, viewerId: string): ChatMessage | null {
+function messageFromData(id: string, data: DocumentData, viewerId: string, pending = false): ChatMessage | null {
   if (typeof data.text !== "string" || typeof data.authorId !== "string") return null;
+  const reply = data.replyTo;
   return {
     id,
     author: data.authorId === viewerId ? "user" : "trainer",
+    authorId: data.authorId,
     text: data.text,
     // Mientras el servidor asigna la hora, se muestra la local.
     timestamp: toDate(data.timestamp) ?? new Date(),
     isRead: Boolean(data.isRead),
+    pending,
+    deleted: data.deleted === true,
+    replyTo:
+      reply && typeof reply === "object" && typeof reply.id === "string" && typeof reply.text === "string"
+        ? { id: reply.id, text: reply.text, authorId: str(reply.authorId) }
+        : null,
   };
 }
 
@@ -2815,6 +2898,11 @@ function chatFromDoc(snap: DocumentSnapshot<DocumentData>): ChatThread | null {
     lastMessageText: strOrNull(data.lastMessageText),
     lastMessageAt: toDate(data.lastMessageAt) ?? toDate(data.modifiedAt),
     lastAuthorId: strOrNull(data.lastAuthorId),
+    readBy: Object.fromEntries(
+      Object.entries((data.readBy as Record<string, unknown> | undefined) ?? {})
+        .map(([uid, value]) => [uid, toDate(value)] as const)
+        .filter((entry): entry is readonly [string, Date] => entry[1] instanceof Date),
+    ),
   };
 }
 

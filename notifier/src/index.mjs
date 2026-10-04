@@ -86,9 +86,10 @@ async function loadChanges(since, now) {
       chatId: d.ref.parent.parent?.id,
       authorId: d.get("authorId"),
       text: d.get("text"),
+      deleted: d.get("deleted") === true,
       timestamp: toDate(d.get("timestamp")),
     }))
-    .filter((m) => m.chatId && typeof m.authorId === "string" && typeof m.text === "string");
+    .filter((m) => m.chatId && typeof m.authorId === "string" && typeof m.text === "string" && m.text.trim() && !m.deleted);
 
   const chatIds = [...new Set(messageRows.map((m) => m.chatId))];
   const authorIds = [...new Set(messageRows.map((m) => m.authorId))];

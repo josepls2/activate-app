@@ -137,12 +137,21 @@ export type OccupiedSlot = {
   trainerId: string | null;
 };
 
+export type ChatReply = { id: string; text: string; authorId: string };
+
 export type ChatMessage = {
   id: string;
   author: "user" | "trainer" | "ai";
+  /** uid de quien escribe (para el nombre en chats con varios entrenadores). */
+  authorId: string;
   text: string;
   timestamp: Date;
   isRead: boolean;
+  /** Todavía no ha llegado al servidor (reloj en lugar de ✓). */
+  pending?: boolean;
+  /** Eliminado para todos por su autor. */
+  deleted?: boolean;
+  replyTo?: ChatReply | null;
 };
 
 export type TrainingPack = {
@@ -401,6 +410,8 @@ export type ChatThread = {
   lastMessageText: string | null;
   lastMessageAt: Date | null;
   lastAuthorId: string | null;
+  /** Último momento en que cada participante abrió la conversación (✓✓ y no leídos). */
+  readBy: Record<string, Date>;
 };
 
 export type NutritionMeal = { name: string; description: string };

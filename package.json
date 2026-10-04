@@ -1,0 +1,17 @@
+{
+  "name": "activate-personal-training",
+  "private": true,
+  "version": "0.1.0",
+  "engines": {
+    "node": "22"
+  },
+  "scripts": {
+    "test": "npm --prefix functions test",
+    "lint": "npm --prefix functions run lint",
+    "firebase:emulators": "firebase emulators:start --only auth,functions,firestore",
+    "firebase:deploy": "firebase deploy --only firestore:rules,firestore:indexes,functions"
+  },
+  "devDependencies": {
+    "firebase-tools": "^15.24.0"
+  }
+}

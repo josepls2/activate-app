@@ -1,0 +1,19 @@
+{
+  "name": "activate-personal-training-functions",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Trusted booking and session workflows for Activate Personal Training.",
+  "main": "src/index.js",
+  "engines": {
+    "node": "22"
+  },
+  "scripts": {
+    "lint": "node --check src/index.js && node --check src/domain.js",
+    "test": "node --test test/*.test.js",
+    "seed": "node scripts/seed-emulator.js"
+  },
+  "dependencies": {
+    "firebase-admin": "^13.0.0",
+    "firebase-functions": "^6.0.0"
+  }
+}

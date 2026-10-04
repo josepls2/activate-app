@@ -1,0 +1,43 @@
+# Notificaciones push de Activate sin Cloud Functions (plan Spark).
+# Requiere el secreto FIREBASE_SERVICE_ACCOUNT (ver notifier/README.md).
+#
+# Horario: cada 20 min de 07:00 a 23:00 (hora de Madrid, aprox.). En un
+# repositorio público los minutos son gratis: puedes poner "*/5 * * * *".
+name: Notificaciones push
+
+on:
+  schedule:
+    - cron: "*/20 5-21 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: notifier
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: notifier
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: notifier/package-lock.json
+      - run: npm ci --omit=dev
+      - name: Enviar notificaciones
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          if [ -z "$FIREBASE_SERVICE_ACCOUNT" ]; then
+            echo "::warning::Falta el secreto FIREBASE_SERVICE_ACCOUNT: no se envían notificaciones."
+            exit 0
+          fi
+          node src/index.mjs

@@ -1,0 +1,19 @@
+name: iOS
+
+# La app de iOS ya no se usa (la sustituye web/). Sólo se ejecuta a mano.
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test Activate iOS
+        run: |
+          xcodebuild \
+            -project ios/CodexGym.xcodeproj \
+            -scheme CodexGym \
+            -destination 'platform=iOS Simulator,name=iPhone 17 Pro' \
+            CODE_SIGNING_ALLOWED=NO \
+            test

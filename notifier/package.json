@@ -1,0 +1,19 @@
+{
+  "name": "activate-notifier",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Envía las notificaciones push de Activate (FCM) sin Cloud Functions: se ejecuta periódicamente.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.mjs",
+    "loop": "node src/index.mjs --loop",
+    "dry-run": "node src/index.mjs --dry-run",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "firebase-admin": "^14.5.0"
+  }
+}

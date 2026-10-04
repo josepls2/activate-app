@@ -1,0 +1,928 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function userPath(uid) {
+      return /databases/$(database)/documents/users/$(uid);
+    }
+
+    function userDocument(uid) {
+      return get(userPath(uid));
+    }
+
+    function role() {
+      return signedIn() && exists(userPath(request.auth.uid))
+        ? userDocument(request.auth.uid).data.role
+        : null;
+    }
+
+    function isBoss() {
+      return role() == 'boss';
+    }
+
+    function isTrainer() {
+      return signedIn() && exists(userPath(request.auth.uid)) && (
+        role() == 'trainer' ||
+        (role() == 'boss' && userDocument(request.auth.uid).data.isTrainer == true)
+      );
+    }
+
+    function isSelf(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    function isAssignedTrainer(userId) {
+      return isTrainer() &&
+        exists(userPath(userId)) &&
+        request.auth.uid in userDocument(userId).data.trainerIds;
+    }
+
+    function validDuration(value) {
+      return value is int && (value == 45 || value == 60);
+    }
+
+    function validPack(data) {
+      return data.packTotalSessions is int &&
+        data.usedSessions is int &&
+        data.reservedSessions is int &&
+        data.remainingSessions is int &&
+        data.packTotalSessions >= 0 &&
+        data.usedSessions >= 0 &&
+        data.reservedSessions >= 0 &&
+        data.remainingSessions >= 0 &&
+        data.packTotalSessions ==
+          data.usedSessions + data.reservedSessions + data.remainingSessions &&
+        validDuration(data.sessionDuration);
+    }
+
+    function validRole(value) {
+      return value in ['client', 'reserve', 'trainer', 'boss'];
+    }
+
+    function validProfile(data, userId) {
+      return data.uid == userId &&
+        data.email is string &&
+        data.name is string &&
+        validRole(data.role) &&
+        data.trainerIds is list &&
+        data.status in ['active', 'deletion_requested', 'disabled'] &&
+        validPack(data) &&
+        (
+          data.cycleTrackingEnabled != true ||
+          (data.role == 'client' && data.gender == 'female')
+        );
+    }
+
+    function counterTransitionIsValid(before, after) {
+      return after.packTotalSessions == before.packTotalSessions &&
+        after.sessionDuration == before.sessionDuration &&
+        validPack(after) && (
+          (
+            after.usedSessions == before.usedSessions &&
+            after.reservedSessions == before.reservedSessions + 1 &&
+            after.remainingSessions == before.remainingSessions - 1
+          ) ||
+          (
+            after.usedSessions == before.usedSessions + 1 &&
+            after.reservedSessions == before.reservedSessions - 1 &&
+            after.remainingSessions == before.remainingSessions
+          ) ||
+          (
+            after.usedSessions == before.usedSessions &&
+            after.reservedSessions == before.reservedSessions - 1 &&
+            after.remainingSessions == before.remainingSessions + 1
+          )
+        );
+    }
+
+    function isKnownRoom(room) {
+      return room in ['Sala de arriba', 'Sala de abajo', 'Sala de fisio'];
+    }
+
+    // ---- Validaciones de formato (endurecimiento web/iOS) ----
+
+    function validDayString(value) {
+      return value is string && value.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$');
+    }
+
+    function dayTimestamp(value) {
+      return timestamp.date(
+        int(value.split('-')[0]),
+        int(value.split('-')[1]),
+        int(value.split('-')[2])
+      );
+    }
+
+    // Desde ayer (margen por husos horarios) hasta un año vista.
+    function bookableDay(value) {
+      return validDayString(value) &&
+        dayTimestamp(value) >= request.time - duration.value(2, 'd') &&
+        dayTimestamp(value) <= request.time + duration.value(366, 'd');
+    }
+
+    function validTime(value) {
+      return value is string && value.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$');
+    }
+
+    function optionalText(value, maxSize) {
+      return value == null || (value is string && value.size() <= maxSize);
+    }
+
+    function roomKeyOf(room) {
+      return {
+        'Sala de arriba': 'upstairs',
+        'Sala de abajo': 'downstairs',
+        'Sala de fisio': 'physio'
+      }[room];
+    }
+
+    function minutesOf(time) {
+      return int(time.split(':')[0]) * 60 + int(time.split(':')[1]);
+    }
+
+    function sessionPath(sessionId) {
+      return /databases/$(database)/documents/sessions/$(sessionId);
+    }
+
+    // Los contadores del bono sólo cambian junto a la sesión que los justifica,
+    // en la misma transacción (reservar, completar o cancelar).
+    function counterMatchesSession(userId, before, after) {
+      let sessionId = after.get('lastSessionId', null);
+      return sessionId is string &&
+        getAfter(sessionPath(sessionId)).data.clientId == userId &&
+        (
+          (
+            after.reservedSessions == before.reservedSessions + 1 &&
+            !exists(sessionPath(sessionId)) &&
+            getAfter(sessionPath(sessionId)).data.status == 'confirmed'
+          ) ||
+          (
+            after.usedSessions == before.usedSessions + 1 &&
+            get(sessionPath(sessionId)).data.status == 'confirmed' &&
+            getAfter(sessionPath(sessionId)).data.status == 'completed'
+          ) ||
+          (
+            after.remainingSessions == before.remainingSessions + 1 &&
+            get(sessionPath(sessionId)).data.status == 'confirmed' &&
+            getAfter(sessionPath(sessionId)).data.status == 'cancelled'
+          )
+        );
+    }
+
+    function isStaff() {
+      return isBoss() || isTrainer();
+    }
+
+    // Inicio de la sesión (hora de Madrid) tratado con 2 h de margen: se usa
+    // para exigir 24 h de antelación al cancelar.
+    function startsAfterHours(date, time, hours) {
+      return validDayString(date) && validTime(time) &&
+        dayTimestamp(date) + duration.value(minutesOf(time) - 120, 'm') >
+          request.time + duration.value(hours, 'h');
+    }
+
+    function validWeek(value) {
+      return validDayString(value);
+    }
+
+    function boundedInt(value, min, max) {
+      return value is int && value >= min && value <= max;
+    }
+
+    function bookingAfter(bookingId) {
+      return getAfter(/databases/$(database)/documents/bookingRequests/$(bookingId)).data;
+    }
+
+    function sessionAfter(sessionId) {
+      return getAfter(/databases/$(database)/documents/sessions/$(sessionId)).data;
+    }
+
+    match /users/{userId} {
+      allow read: if
+        isSelf(userId) ||
+        isBoss() ||
+        (
+          isTrainer() &&
+          resource.data.role == 'client' &&
+          request.auth.uid in resource.data.trainerIds
+        ) ||
+        (
+          role() == 'client' &&
+          (
+            resource.data.role == 'trainer' ||
+            (resource.data.role == 'boss' && resource.data.isTrainer == true)
+          ) &&
+          userId in userDocument(request.auth.uid).data.trainerIds
+        );
+
+      // En Spark, Dirección crea el perfil tras crear la cuenta de Firebase Auth.
+      allow create: if isBoss() && validProfile(request.resource.data, userId);
+
+      allow update: if
+        (
+          isBoss() && validProfile(request.resource.data, userId)
+        ) ||
+        (
+          isSelf(userId) &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'name', 'avatar', 'phone', 'notificationPreferences', 'language',
+            'cycleSharingEnabled', 'termsAccepted', 'termsAcceptedAt',
+            'termsVersion', 'imageConsent', 'imageConsentAt', 'status',
+            'deletionRequestedAt', 'modifiedAt', 'weeklyGoal',
+            'leaderboardOptIn', 'onboardedAt'
+          ]) &&
+          (
+            !('weeklyGoal' in request.resource.data) ||
+            boundedInt(request.resource.data.weeklyGoal, 1, 7)
+          ) &&
+          (
+            !('leaderboardOptIn' in request.resource.data) ||
+            request.resource.data.leaderboardOptIn is bool
+          ) &&
+          optionalText(request.resource.data.get('name', null), 80) &&
+          optionalText(request.resource.data.get('phone', null), 30) &&
+          request.resource.data.role == resource.data.role &&
+          request.resource.data.packTotalSessions == resource.data.packTotalSessions &&
+          request.resource.data.usedSessions == resource.data.usedSessions &&
+          request.resource.data.reservedSessions == resource.data.reservedSessions &&
+          request.resource.data.remainingSessions == resource.data.remainingSessions &&
+          (
+            request.resource.data.status == resource.data.status ||
+            (
+              resource.data.status == 'active' &&
+              request.resource.data.status == 'deletion_requested'
+            )
+          )
+        ) ||
+        (
+          (isBoss() || isAssignedTrainer(userId)) &&
+          resource.data.role in ['client', 'reserve'] &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'usedSessions', 'reservedSessions', 'remainingSessions',
+            'modifiedAt', 'modifiedBy', 'lastSessionId'
+          ]) &&
+          request.resource.data.modifiedBy == request.auth.uid &&
+          counterTransitionIsValid(resource.data, request.resource.data) &&
+          counterMatchesSession(userId, resource.data, request.resource.data)
+        ) ||
+        // El propio cliente cancela con antelación: la sesión vuelve al bono.
+        (
+          isSelf(userId) &&
+          resource.data.role in ['client', 'reserve'] &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'reservedSessions', 'remainingSessions', 'modifiedAt', 'modifiedBy',
+            'lastSessionId'
+          ]) &&
+          request.resource.data.modifiedBy == request.auth.uid &&
+          request.resource.data.reservedSessions == resource.data.reservedSessions - 1 &&
+          request.resource.data.remainingSessions == resource.data.remainingSessions + 1 &&
+          counterTransitionIsValid(resource.data, request.resource.data) &&
+          counterMatchesSession(userId, resource.data, request.resource.data)
+        );
+
+      allow delete: if false;
+
+      // Dispositivos para notificaciones push (los lee el notificador con Admin SDK).
+      match /pushTokens/{tokenId} {
+        allow read, delete: if isSelf(userId);
+        allow create, update: if isSelf(userId) &&
+          request.resource.data.keys().hasOnly(['token', 'userAgent', 'updatedAt']) &&
+          request.resource.data.token is string &&
+          request.resource.data.token.size() > 20 &&
+          request.resource.data.token.size() <= 4096 &&
+          optionalText(request.resource.data.get('userAgent', null), 300) &&
+          request.resource.data.updatedAt == request.time;
+      }
+
+      match /cycleEntries/{entryId} {
+        function cycleOwner() {
+          return isSelf(userId) &&
+            userDocument(userId).data.role == 'client' &&
+            userDocument(userId).data.gender == 'female' &&
+            userDocument(userId).data.cycleTrackingEnabled == true;
+        }
+
+        allow read, delete: if cycleOwner();
+        allow create, update: if cycleOwner() &&
+          entryId == request.resource.data.date &&
+          validDayString(request.resource.data.date) &&
+          request.resource.data.keys().hasOnly([
+            'date', 'flow', 'symptoms', 'mood', 'notes', 'modifiedAt'
+          ]) &&
+          request.resource.data.flow in ['none', 'light', 'medium', 'heavy'] &&
+          request.resource.data.symptoms is list &&
+          request.resource.data.symptoms.size() <= 10 &&
+          optionalText(request.resource.data.notes, 2000);
+      }
+
+      match /cycleSummaries/{entryId} {
+        allow read: if isBoss() || isSelf(userId) || (
+          isAssignedTrainer(userId) &&
+          userDocument(userId).data.gender == 'female' &&
+          userDocument(userId).data.cycleTrackingEnabled == true &&
+          userDocument(userId).data.cycleSharingEnabled == true
+        );
+        allow create, update: if isSelf(userId) &&
+          userDocument(userId).data.gender == 'female' &&
+          userDocument(userId).data.cycleTrackingEnabled == true &&
+          request.resource.data.keys().hasOnly([
+            'date', 'flow', 'symptoms', 'mood', 'modifiedAt'
+          ]);
+        allow delete: if isSelf(userId) &&
+          userDocument(userId).data.gender == 'female' &&
+          userDocument(userId).data.cycleTrackingEnabled == true;
+      }
+    }
+
+    match /bookingRequests/{bookingId} {
+      allow read: if signedIn() && (
+        isBoss() ||
+        request.auth.uid == resource.data.trainerId ||
+        request.auth.uid == resource.data.clientId
+      );
+
+      allow create: if signedIn() &&
+        request.resource.data.keys().hasOnly([
+          'clientId', 'clientName', 'trainerId', 'trainerName', 'kind',
+          'requestedDate', 'requestedTime', 'type', 'duration', 'room',
+          'status', 'proposedTime', 'finalTime', 'trainerNotes', 'bossNotes',
+          'createdAt', 'modifiedAt'
+        ]) &&
+        request.resource.data.keys().hasAll([
+          'clientId', 'clientName', 'trainerId', 'kind', 'requestedDate',
+          'requestedTime', 'type', 'duration', 'room', 'status'
+        ]) &&
+        request.resource.data.clientId == request.auth.uid &&
+        request.resource.data.clientName == userDocument(request.auth.uid).data.name &&
+        request.resource.data.duration == userDocument(request.auth.uid).data.sessionDuration &&
+        userDocument(request.auth.uid).data.status == 'active' &&
+        userDocument(request.auth.uid).data.termsAccepted == true &&
+        userDocument(request.auth.uid).data.remainingSessions > 0 &&
+        validDuration(request.resource.data.duration) &&
+        isKnownRoom(request.resource.data.room) &&
+        bookableDay(request.resource.data.requestedDate) &&
+        validTime(request.resource.data.requestedTime) &&
+        request.resource.data.type is string &&
+        request.resource.data.type.size() <= 60 &&
+        optionalText(request.resource.data.get('trainerName', null), 80) &&
+        request.resource.data.get('finalTime', null) == null &&
+        request.resource.data.get('trainerNotes', null) == null &&
+        request.resource.data.get('bossNotes', null) == null &&
+        request.resource.data.proposedTime == request.resource.data.requestedTime &&
+        request.resource.data.createdAt == request.time &&
+        (
+          (
+            role() == 'client' &&
+            request.resource.data.kind == 'training' &&
+            request.resource.data.status == 'pending_trainer' &&
+            request.resource.data.trainerId in userDocument(request.auth.uid).data.trainerIds
+          ) ||
+          (
+            role() == 'reserve' &&
+            request.resource.data.kind == 'room_rental' &&
+            request.resource.data.status == 'pending_boss' &&
+            request.resource.data.trainerId == ''
+          )
+        );
+
+      // Sólo cambian estado, hora final, sala, notas y enlace a la sesión.
+      // Fecha, cliente, entrenador, tipo y duración quedan bloqueados.
+      // El cliente puede retirar su propia solicitud mientras esté pendiente.
+      allow update: if (
+          isSelf(resource.data.clientId) &&
+          resource.data.status in ['pending_trainer', 'pending_boss'] &&
+          request.resource.data.status == 'cancelled' &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'modifiedAt'])
+        ) || (
+        (
+          isBoss() ||
+          (
+            isTrainer() &&
+            resource.data.kind == 'training' &&
+            resource.data.trainerId == request.auth.uid
+          )
+        ) &&
+        resource.data.status in ['pending_trainer', 'pending_boss'] &&
+        (
+          (
+            request.resource.data.status == 'rejected' &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+              'status', 'rejectionReason', 'modifiedAt'
+            ]) &&
+            optionalText(request.resource.data.get('rejectionReason', null), 300)
+          ) ||
+          (
+            request.resource.data.status == 'confirmed' &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+              'status', 'finalTime', 'room', 'trainerNotes', 'sessionId', 'modifiedAt'
+            ]) &&
+            validTime(request.resource.data.finalTime) &&
+            isKnownRoom(request.resource.data.room) &&
+            optionalText(request.resource.data.get('trainerNotes', null), 1000) &&
+            request.resource.data.sessionId == bookingId &&
+            sessionAfter(bookingId).status == 'confirmed'
+          )
+        ));
+
+      allow delete: if false;
+    }
+
+    match /sessions/{sessionId} {
+      allow read: if signedIn() && (
+        isBoss() ||
+        request.auth.uid == resource.data.trainerId ||
+        request.auth.uid == resource.data.clientId
+      );
+
+      // La sesión debe copiar exactamente la solicitud confirmada en la misma
+      // transacción. Un entrenador sólo crea sesiones a su propio nombre.
+      allow create: if (isBoss() || isAssignedTrainer(request.resource.data.clientId)) &&
+        request.resource.data.bookingRequestId == sessionId &&
+        request.resource.data.status == 'confirmed' &&
+        validDuration(request.resource.data.duration) &&
+        isKnownRoom(request.resource.data.room) &&
+        validTime(request.resource.data.time) &&
+        optionalText(request.resource.data.get('trainerNotes', null), 1000) &&
+        request.resource.data.get('feedback', null) == null &&
+        (isBoss() || request.resource.data.trainerId == request.auth.uid) &&
+        bookingAfter(sessionId).status == 'confirmed' &&
+        bookingAfter(sessionId).clientId == request.resource.data.clientId &&
+        bookingAfter(sessionId).trainerId == request.resource.data.trainerId &&
+        bookingAfter(sessionId).kind == request.resource.data.kind &&
+        bookingAfter(sessionId).requestedDate == request.resource.data.date &&
+        bookingAfter(sessionId).duration == request.resource.data.duration &&
+        bookingAfter(sessionId).finalTime == request.resource.data.time &&
+        bookingAfter(sessionId).room == request.resource.data.room;
+
+      allow update: if resource.data.status == 'confirmed' && (
+        // Completar: entrenador asignado a la sesión o Dirección.
+        (
+          (isBoss() || (isTrainer() && resource.data.trainerId == request.auth.uid)) &&
+          request.resource.data.status == 'completed' &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'status', 'feedback', 'noShow', 'modifiedAt', 'modifiedBy'
+          ]) &&
+          request.resource.data.get('noShow', false) is bool &&
+          optionalText(request.resource.data.get('feedback', null), 2000)
+        ) ||
+        // Cancelación del propio cliente con más de 24 h de antelación.
+        (
+          isSelf(resource.data.clientId) &&
+          request.resource.data.status == 'cancelled' &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'status', 'cancellationReason', 'modifiedAt', 'modifiedBy'
+          ]) &&
+          request.resource.data.modifiedBy == request.auth.uid &&
+          optionalText(request.resource.data.get('cancellationReason', null), 300) &&
+          startsAfterHours(resource.data.date, resource.data.time, 24)
+        ) ||
+        // Reprogramar: sólo Dirección.
+        (
+          isBoss() &&
+          request.resource.data.status == 'confirmed' &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'date', 'time', 'room', 'modifiedAt', 'modifiedBy'
+          ]) &&
+          validDayString(request.resource.data.date) &&
+          validTime(request.resource.data.time) &&
+          isKnownRoom(request.resource.data.room)
+        ) ||
+        // Cancelar: sólo Dirección.
+        (
+          isBoss() &&
+          request.resource.data.status == 'cancelled' &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'status', 'cancellationReason', 'modifiedAt', 'modifiedBy'
+          ]) &&
+          optionalText(request.resource.data.get('cancellationReason', null), 300)
+        )
+      );
+
+      allow delete: if false;
+    }
+
+    match /occupancy/{occupancyId} {
+      // Ocupación anónima en bloques de 15 minutos.
+      allow read: if signedIn();
+      allow create: if (isBoss() || isTrainer()) &&
+        request.resource.data.keys().hasOnly([
+          'sessionId', 'kind', 'date', 'time', 'duration', 'room',
+          'trainerId', 'createdAt'
+        ]) &&
+        request.resource.data.sessionId is string &&
+        validTime(request.resource.data.time) &&
+        request.resource.data.duration == 15 &&
+        // El bloque debe caer dentro de la franja real de la sesión.
+        minutesOf(request.resource.data.time) >= minutesOf(sessionAfter(request.resource.data.sessionId).time) &&
+        minutesOf(request.resource.data.time) <
+          minutesOf(sessionAfter(request.resource.data.sessionId).time) +
+          sessionAfter(request.resource.data.sessionId).duration &&
+        int(occupancyId.split('_')[3]) == minutesOf(request.resource.data.time) &&
+        sessionAfter(request.resource.data.sessionId).status == 'confirmed' &&
+        request.resource.data.date == sessionAfter(request.resource.data.sessionId).date &&
+        request.resource.data.room == sessionAfter(request.resource.data.sessionId).room &&
+        (
+          (
+            sessionAfter(request.resource.data.sessionId).trainerId == '' &&
+            request.resource.data.trainerId == null
+          ) ||
+          request.resource.data.trainerId == sessionAfter(request.resource.data.sessionId).trainerId
+        ) &&
+        (isBoss() || sessionAfter(request.resource.data.sessionId).trainerId == request.auth.uid) &&
+        occupancyId.matches(
+          '^(room|trainer)_[A-Za-z0-9]+_' + request.resource.data.date + '_[0-9]{4}$'
+        ) &&
+        (
+          (
+            occupancyId.matches('^room_.*') &&
+            occupancyId.split('_')[1] == roomKeyOf(request.resource.data.room)
+          ) ||
+          (
+            occupancyId.matches('^trainer_.*') &&
+            occupancyId.split('_')[1] == request.resource.data.trainerId
+          )
+        );
+      allow update: if false;
+      allow delete: if isBoss() || (
+        resource.data.sessionId is string &&
+        sessionAfter(resource.data.sessionId).status == 'cancelled' &&
+        sessionAfter(resource.data.sessionId).clientId == request.auth.uid
+      );
+    }
+
+    match /rooms/{roomId} {
+      allow read: if signedIn();
+      allow create, update: if isBoss();
+      allow delete: if false;
+    }
+
+    match /staffDirectory/{staffId} {
+      // Contiene emails del equipo: no se expone a clientes.
+      allow read: if isBoss() || isTrainer();
+      allow create, update: if isBoss();
+      allow delete: if false;
+    }
+
+    // Índice privado por DNI/NIE para evitar duplicados y acelerar el alta.
+    // El documento nunca se expone a clientes ni entrenadores.
+    match /clientDocuments/{normalizedDocument} {
+      allow read, create, update: if isBoss();
+      allow delete: if false;
+    }
+
+    match /deletionRequests/{userId} {
+      allow read: if isSelf(userId) || isBoss();
+      allow create: if isSelf(userId) &&
+        request.resource.data.keys().hasOnly(['uid', 'email', 'status', 'requestedAt']) &&
+        request.resource.data.uid == request.auth.uid &&
+        request.resource.data.status == 'pending';
+      allow update: if isBoss() &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'status', 'processedAt', 'processedBy'
+        ]) &&
+        request.resource.data.status in ['pending', 'processed'];
+      allow delete: if false;
+    }
+
+    match /chats/{chatId} {
+      function participantsAllowed(data, clientId) {
+        return data.participantIds is list &&
+          data.participantIds.hasAll([clientId]) &&
+          data.participantIds.hasOnly(
+            userDocument(clientId).data.trainerIds.concat([clientId])
+          );
+      }
+
+      function chatFieldsValid(data) {
+        return data.keys().hasOnly([
+            'participantIds', 'clientId', 'modifiedAt', 'lastMessageAt',
+            'lastMessageText', 'lastAuthorId'
+          ]) &&
+          optionalText(data.get('lastMessageText', null), 1000);
+      }
+
+      // get: también el propio cliente cuando su chat todavía no existe.
+      allow get: if signedIn() && (
+        (resource == null && chatId == request.auth.uid) ||
+        (resource != null && request.auth.uid in resource.data.participantIds)
+      );
+      allow list: if signedIn() && request.auth.uid in resource.data.participantIds;
+
+      // El chat lo abre la clienta/el cliente o uno de sus entrenadores asignados.
+      allow create: if chatId == request.resource.data.clientId &&
+        exists(userPath(chatId)) &&
+        userDocument(chatId).data.role == 'client' &&
+        (isSelf(chatId) || isAssignedTrainer(chatId)) &&
+        participantsAllowed(request.resource.data, chatId) &&
+        chatFieldsValid(request.resource.data) &&
+        request.resource.data.get('lastAuthorId', request.auth.uid) == request.auth.uid;
+
+      // Los participantes actualizan el resumen; sólo el cliente puede
+      // refrescar la lista de participantes con sus entrenadores actuales.
+      allow update: if signedIn() &&
+        request.auth.uid in resource.data.participantIds &&
+        request.resource.data.clientId == resource.data.clientId &&
+        chatFieldsValid(request.resource.data) &&
+        (
+          !('lastAuthorId' in request.resource.data.diff(resource.data).affectedKeys()) ||
+          request.resource.data.lastAuthorId == request.auth.uid
+        ) &&
+        (
+          request.resource.data.participantIds == resource.data.participantIds ||
+          (
+            isSelf(resource.data.clientId) &&
+            participantsAllowed(request.resource.data, resource.data.clientId)
+          )
+        );
+      allow delete: if false;
+
+      match /messages/{messageId} {
+        allow read: if signedIn() && request.auth.uid in
+          get(/databases/$(database)/documents/chats/$(chatId)).data.participantIds;
+        allow create: if signedIn() &&
+          request.auth.uid in
+            getAfter(/databases/$(database)/documents/chats/$(chatId)).data.participantIds &&
+          request.resource.data.keys().hasOnly([
+            'authorId', 'authorRole', 'text', 'timestamp', 'isRead'
+          ]) &&
+          request.resource.data.authorId == request.auth.uid &&
+          request.resource.data.get('authorRole', role()) == role() &&
+          request.resource.data.get('isRead', false) == false &&
+          request.resource.data.timestamp == request.time &&
+          request.resource.data.text is string &&
+          request.resource.data.text.size() > 0 &&
+          request.resource.data.text.size() <= 1000;
+        allow update, delete: if false;
+      }
+    }
+
+    // Un plan por cliente: nutritionPlans/{clientId}.
+    match /nutritionPlans/{clientId} {
+      allow read: if signedIn() && (
+        isBoss() || isSelf(clientId) || isAssignedTrainer(clientId)
+      );
+      allow create, update: if (isBoss() || isAssignedTrainer(clientId)) &&
+        exists(userPath(clientId)) &&
+        userDocument(clientId).data.role == 'client' &&
+        request.resource.data.keys().hasOnly([
+          'clientId', 'title', 'goal', 'meals', 'notes', 'updatedAt',
+          'updatedBy', 'updatedByName'
+        ]) &&
+        request.resource.data.clientId == clientId &&
+        request.resource.data.title is string &&
+        request.resource.data.title.size() > 0 &&
+        request.resource.data.title.size() <= 80 &&
+        optionalText(request.resource.data.get('goal', null), 300) &&
+        optionalText(request.resource.data.get('notes', null), 2000) &&
+        optionalText(request.resource.data.get('updatedByName', null), 80) &&
+        request.resource.data.meals is list &&
+        request.resource.data.meals.size() <= 8 &&
+        request.resource.data.updatedBy == request.auth.uid &&
+        request.resource.data.updatedAt == request.time;
+      allow delete: if isBoss() || isAssignedTrainer(clientId);
+    }
+
+    match /activityLogs/{logId} {
+      allow read: if isBoss();
+      allow create: if signedIn() &&
+        (
+          isStaff() ||
+          request.resource.data.action in ['client_cancel_session', 'client_cancel_request']
+        ) &&
+        request.resource.data.keys().hasOnly([
+          'actorId', 'action', 'resourceId', 'staffId', 'sessionsAdded', 'createdAt'
+        ]) &&
+        request.resource.data.actorId == request.auth.uid &&
+        request.resource.data.action is string &&
+        request.resource.data.action.size() <= 60 &&
+        request.resource.data.createdAt == request.time;
+      allow update, delete: if false;
+    }
+
+    // ---------- Retos semanales ----------
+    // Dirección crea retos para todos; cada entrenador, para sus clientes.
+    match /challenges/{challengeId} {
+      function challengeValid(data) {
+        return data.keys().hasOnly([
+            'title', 'description', 'weekKey', 'target', 'unit', 'points',
+            'audience', 'trainerId', 'createdBy', 'createdByName', 'createdAt',
+            'active'
+          ]) &&
+          data.title is string && data.title.size() > 0 && data.title.size() <= 80 &&
+          optionalText(data.get('description', null), 500) &&
+          validWeek(data.weekKey) &&
+          boundedInt(data.target, 1, 100) &&
+          data.unit is string && data.unit.size() > 0 && data.unit.size() <= 20 &&
+          boundedInt(data.points, 0, 100) &&
+          data.active is bool &&
+          (
+            (data.audience == 'all' && data.trainerId == null) ||
+            (data.audience == 'trainer' && data.trainerId is string)
+          );
+      }
+
+      allow read: if signedIn();
+      allow create: if challengeValid(request.resource.data) &&
+        request.resource.data.createdBy == request.auth.uid &&
+        optionalText(request.resource.data.get('createdByName', null), 80) &&
+        request.resource.data.createdAt == request.time &&
+        (
+          (isBoss() && (
+            request.resource.data.audience == 'all' ||
+            request.resource.data.trainerId == request.auth.uid
+          )) ||
+          (
+            isTrainer() &&
+            request.resource.data.audience == 'trainer' &&
+            request.resource.data.trainerId == request.auth.uid
+          )
+        );
+      allow update: if (isBoss() || resource.data.createdBy == request.auth.uid) &&
+        challengeValid(request.resource.data) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'title', 'description', 'target', 'unit', 'points', 'active'
+        ]);
+      allow delete: if isBoss() || resource.data.createdBy == request.auth.uid;
+    }
+
+    // Progreso de cada cliente en un reto: challengeProgress/{challengeId}_{uid}.
+    // El cliente apunta su progreso; su entrenador (o Dirección) da feedback.
+    match /challengeProgress/{progressId} {
+      function challengeOf(data) {
+        return get(/databases/$(database)/documents/challenges/$(data.challengeId)).data;
+      }
+
+      function identityValid(data) {
+        return progressId == data.challengeId + '_' + data.uid &&
+          exists(/databases/$(database)/documents/challenges/$(data.challengeId)) &&
+          challengeOf(data).weekKey == data.weekKey &&
+          userDocument(data.uid).data.role == 'client' &&
+          data.trainerIds == userDocument(data.uid).data.trainerIds &&
+          (
+            challengeOf(data).audience == 'all' ||
+            challengeOf(data).trainerId in userDocument(data.uid).data.trainerIds
+          );
+      }
+
+      function clientFieldsValid(data) {
+        return boundedInt(data.progress, 0, 1000) &&
+          data.checkIns is list && data.checkIns.size() <= 7 &&
+          optionalText(data.get('note', null), 300) &&
+          data.completed is bool;
+      }
+
+      function feedbackValid(data) {
+        return optionalText(data.get('feedback', null), 1000) &&
+          optionalText(data.get('feedbackByName', null), 80) &&
+          data.get('approved', false) is bool;
+      }
+
+      allow read: if signedIn() && (
+        resource.data.uid == request.auth.uid ||
+        isBoss() ||
+        request.auth.uid in resource.data.trainerIds
+      );
+
+      allow create: if request.resource.data.keys().hasOnly([
+          'challengeId', 'uid', 'weekKey', 'trainerIds', 'progress', 'checkIns',
+          'note', 'completed', 'updatedAt', 'feedback', 'feedbackBy',
+          'feedbackByName', 'feedbackAt', 'approved'
+        ]) &&
+        identityValid(request.resource.data) &&
+        clientFieldsValid(request.resource.data) &&
+        feedbackValid(request.resource.data) &&
+        (
+          // El cliente empieza el reto (sin feedback).
+          (
+            isSelf(request.resource.data.uid) &&
+            request.resource.data.get('feedback', null) == null &&
+            request.resource.data.get('approved', false) == false &&
+            request.resource.data.updatedAt == request.time
+          ) ||
+          // El entrenador deja feedback aunque el cliente no haya apuntado nada.
+          (
+            (isBoss() || isAssignedTrainer(request.resource.data.uid)) &&
+            request.resource.data.progress == 0 &&
+            request.resource.data.feedbackBy == request.auth.uid &&
+            request.resource.data.feedbackAt == request.time
+          )
+        );
+
+      allow update: if request.resource.data.challengeId == resource.data.challengeId &&
+        request.resource.data.uid == resource.data.uid &&
+        request.resource.data.weekKey == resource.data.weekKey &&
+        (
+          // Cliente: su progreso, hasta que el entrenador lo apruebe.
+          (
+            isSelf(resource.data.uid) &&
+            resource.data.get('approved', false) == false &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+              'progress', 'checkIns', 'note', 'completed', 'updatedAt', 'trainerIds'
+            ]) &&
+            request.resource.data.trainerIds == userDocument(resource.data.uid).data.trainerIds &&
+            clientFieldsValid(request.resource.data) &&
+            request.resource.data.updatedAt == request.time
+          ) ||
+          // Entrenador asignado o Dirección: feedback y aprobación.
+          (
+            (isBoss() || isAssignedTrainer(resource.data.uid)) &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+              'feedback', 'feedbackBy', 'feedbackByName', 'feedbackAt', 'approved'
+            ]) &&
+            feedbackValid(request.resource.data) &&
+            request.resource.data.feedbackBy == request.auth.uid &&
+            request.resource.data.feedbackAt == request.time
+          )
+        );
+
+      allow delete: if false;
+    }
+
+    // ---------- Clasificación semanal ----------
+    // leaderboard/{weekKey}_{uid}. La escribe el equipo al completar sesiones
+    // o aprobar retos; «visible» copia la elección del cliente.
+    match /leaderboard/{entryId} {
+      allow read: if signedIn() && (
+        resource.data.visible == true ||
+        resource.data.uid == request.auth.uid ||
+        isStaff()
+      );
+
+      allow create, update: if
+        (
+          (isBoss() || isAssignedTrainer(request.resource.data.uid)) &&
+          request.resource.data.keys().hasOnly([
+            'weekKey', 'uid', 'displayName', 'sessions', 'challengePoints',
+            'visible', 'updatedAt'
+          ]) &&
+          entryId == request.resource.data.weekKey + '_' + request.resource.data.uid &&
+          validWeek(request.resource.data.weekKey) &&
+          request.resource.data.displayName is string &&
+          request.resource.data.displayName.size() <= 40 &&
+          boundedInt(request.resource.data.sessions, 0, 50) &&
+          boundedInt(request.resource.data.challengePoints, 0, 2000) &&
+          request.resource.data.visible ==
+            userDocument(request.resource.data.uid).data.get('leaderboardOptIn', false) &&
+          request.resource.data.updatedAt == request.time &&
+          (resource == null || request.resource.data.uid == resource.data.uid)
+        ) ||
+        // El cliente decide si se le ve (sólo ese campo).
+        (
+          resource != null &&
+          isSelf(resource.data.uid) &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['visible']) &&
+          request.resource.data.visible is bool
+        );
+
+      allow delete: if false;
+    }
+
+    // ---------- Consejos para una vida sana ----------
+    match /tips/{tipId} {
+      allow read: if signedIn();
+      allow create: if isStaff() &&
+        request.resource.data.keys().hasOnly([
+          'title', 'body', 'category', 'createdBy', 'createdByName', 'createdAt'
+        ]) &&
+        request.resource.data.title is string &&
+        request.resource.data.title.size() > 0 &&
+        request.resource.data.title.size() <= 80 &&
+        request.resource.data.body is string &&
+        request.resource.data.body.size() > 0 &&
+        request.resource.data.body.size() <= 1000 &&
+        request.resource.data.category in [
+          'hidratacion', 'sueno', 'nutricion', 'movilidad', 'mente', 'habitos'
+        ] &&
+        optionalText(request.resource.data.get('createdByName', null), 80) &&
+        request.resource.data.createdBy == request.auth.uid &&
+        request.resource.data.createdAt == request.time;
+      allow update: if false;
+      allow delete: if isBoss() || resource.data.createdBy == request.auth.uid;
+    }
+
+    // ---------- Notas privadas del entrenador sobre un cliente ----------
+    // El cliente nunca las ve.
+    match /trainerNotes/{clientId} {
+      allow read: if isBoss() || isAssignedTrainer(clientId);
+      allow create, update: if (isBoss() || isAssignedTrainer(clientId)) &&
+        request.resource.data.keys().hasOnly([
+          'notes', 'updatedAt', 'updatedBy', 'updatedByName'
+        ]) &&
+        request.resource.data.notes is string &&
+        request.resource.data.notes.size() <= 4000 &&
+        optionalText(request.resource.data.get('updatedByName', null), 80) &&
+        request.resource.data.updatedBy == request.auth.uid &&
+        request.resource.data.updatedAt == request.time;
+      allow delete: if false;
+    }
+
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
